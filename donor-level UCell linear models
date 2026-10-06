@@ -1,0 +1,234 @@
+options(stringsAsFactors = FALSE)
+
+suppressPackageStartupMessages({
+  .libPaths(c("C:/Users/veerc/Documents/Review/Rlib", .libPaths()))
+  library(Matrix)
+  library(UCell)
+})
+
+work_dir <- "C:/Users/veerc/Documents/Review"
+rds_path <- "C:/Users/veerc/Desktop/IFNA/DATA/ROSMAP_pericyte.rds.bak"
+gsea_path <- "C:/Users/veerc/Desktop/IFNA_data/Human/Supplymentary1.Hallmark_GSEA_all.tsv"
+out_dir <- file.path(work_dir, "outputs", "rosmap_pericyte_supplymentary1_leading_ucell_lm")
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+get_layer_matrix <- function(seu, assay_name = NULL, layer_name = "data.1") {
+  if (is.null(assay_name)) assay_name <- attr(seu, "active.assay")
+  assay <- attr(seu, "assays")[[assay_name]]
+  mat <- attr(assay, "layers")[[layer_name]]
+  features <- attr(assay, "features")
+  cells <- attr(assay, "cells")
+  attr(features, "class") <- NULL
+  attr(cells, "class") <- NULL
+  genes <- dimnames(features)[[1]][features[, layer_name]]
+  cell_names <- dimnames(cells)[[1]][cells[, layer_name]]
+  rownames(mat) <- genes
+  colnames(mat) <- cell_names
+  mat
+}
+
+split_leading <- function(x) {
+  x <- unlist(strsplit(x, "[,;]"))
+  x <- trimws(x)
+  unique(x[nzchar(x)])
+}
+
+first_non_na <- function(x) {
+  x <- x[!is.na(x)]
+  if (length(x) == 0) return(NA)
+  x[1]
+}
+
+mean_no_na <- function(x) {
+  if (all(is.na(x))) return(NA_real_)
+  mean(x, na.rm = TRUE)
+}
+
+fit_one <- function(dat, score_col, comparison, predictor, covars, group_var, group_a, group_b) {
+  use_cols <- unique(c(score_col, predictor, covars, group_var))
+  d <- dat[, use_cols, drop = FALSE]
+  names(d)[names(d) == score_col] <- "score"
+  d <- d[complete.cases(d), , drop = FALSE]
+  d[[predictor]] <- droplevels(factor(d[[predictor]]))
+  if (nrow(d) < 6 || length(unique(d[[predictor]])) < 2) {
+    return(data.frame(
+      comparison = comparison, module = score_col, n = nrow(d),
+      n_group_a = sum(d[[group_var]] == group_a, na.rm = TRUE),
+      n_group_b = sum(d[[group_var]] == group_b, na.rm = TRUE),
+      group_a = group_a, group_b = group_b,
+      mean_group_a = mean_no_na(d$score[d[[group_var]] == group_a]),
+      mean_group_b = mean_no_na(d$score[d[[group_var]] == group_b]),
+      beta = NA_real_, p = NA_real_, direction = NA_character_,
+      model = NA_character_, stringsAsFactors = FALSE
+    ))
+  }
+  form <- as.formula(paste("score ~", paste(c(predictor, covars), collapse = " + ")))
+  fit <- lm(form, data = d)
+  co <- summary(fit)$coefficients
+  term <- grep(paste0("^", predictor), rownames(co), value = TRUE)[1]
+  beta <- unname(co[term, "Estimate"])
+  p <- unname(co[term, "Pr(>|t|)"])
+  mean_a <- mean_no_na(d$score[d[[group_var]] == group_a])
+  mean_b <- mean_no_na(d$score[d[[group_var]] == group_b])
+  data.frame(
+    comparison = comparison,
+    module = score_col,
+    n = nrow(d),
+    n_group_a = sum(d[[group_var]] == group_a, na.rm = TRUE),
+    n_group_b = sum(d[[group_var]] == group_b, na.rm = TRUE),
+    group_a = group_a,
+    group_b = group_b,
+    mean_group_a = mean_a,
+    mean_group_b = mean_b,
+    beta = beta,
+    p = p,
+    direction = ifelse(beta > 0, paste0(group_b, " higher"), paste0(group_b, " lower")),
+    model = paste(deparse(form), collapse = ""),
+    stringsAsFactors = FALSE
+  )
+}
+
+message("Reading object...")
+seu <- readRDS(rds_path)
+md <- attr(seu, "meta.data")
+mat <- get_layer_matrix(seu, assay_name = "RNA", layer_name = "data.1")
+md <- md[colnames(mat), , drop = FALSE]
+
+message("Reading Supplymentary1 leading genes...")
+gsea <- read.delim(gsea_path, check.names = FALSE)
+target_pathways <- c(
+  INTERFERON_ALPHA_RESPONSE = "HALLMARK_INTERFERON_ALPHA_RESPONSE",
+  MYC_TARGETS_V2 = "HALLMARK_MYC_TARGETS_V2",
+  MITOTIC_SPINDLE = "HALLMARK_MITOTIC_SPINDLE",
+  G2M_CHECKPOINT = "HALLMARK_G2M_CHECKPOINT"
+)
+gsea_sub <- gsea[
+  gsea$dataset == "ROSMAP" &
+    gsea$method == "nebula" &
+    gsea$model_label == "+age" &
+    gsea$pathway %in% unname(target_pathways),
+]
+if (nrow(gsea_sub) != length(target_pathways)) {
+  stop("Expected ", length(target_pathways), " selected GSEA rows; found ", nrow(gsea_sub))
+}
+
+gene_sets <- lapply(target_pathways, function(pathway) {
+  split_leading(gsea_sub$leadingEdge[gsea_sub$pathway == pathway][1])
+})
+names(gene_sets) <- names(target_pathways)
+features <- lapply(gene_sets, function(g) intersect(g, rownames(mat)))
+
+gene_counts <- data.frame(
+  module = names(gene_sets),
+  pathway = unname(target_pathways),
+  n_leading = lengths(gene_sets),
+  n_present = vapply(features, length, integer(1)),
+  genes_used = vapply(features, paste, collapse = ";", FUN.VALUE = character(1)),
+  stringsAsFactors = FALSE
+)
+write.csv(gene_counts, file.path(out_dir, "Supplymentary1_ROSMAP_nebula_age_leading_gene_counts.csv"), row.names = FALSE)
+
+message("Computing UCell scores...")
+uc <- UCell::ScoreSignatures_UCell(
+  matrix = mat,
+  features = features,
+  maxRank = 1500,
+  name = "",
+  chunk.size = 100,
+  ncores = 1
+)
+uc <- as.data.frame(uc)
+
+cell_scores <- data.frame(
+  cell = colnames(mat),
+  donor_id = md$donor_id,
+  subject = if ("subject" %in% colnames(md)) md$subject else md$donor_id,
+  disease = md$disease_std,
+  sex = md$sex_std,
+  age = md$age_analysis,
+  PMI = md$pmi_hours_analysis,
+  stringsAsFactors = FALSE
+)
+for (nm in names(features)) cell_scores[[nm]] <- uc[[nm]]
+write.csv(cell_scores, file.path(out_dir, "Supplymentary1_leading_UCell_cell_scores.csv"), row.names = FALSE)
+
+message("Aggregating donor means...")
+donors <- unique(cell_scores$donor_id)
+donor_scores <- do.call(rbind, lapply(donors, function(id) {
+  d <- cell_scores[cell_scores$donor_id == id, , drop = FALSE]
+  row <- data.frame(
+    donor_id = id,
+    subject = first_non_na(d$subject),
+    disease = first_non_na(d$disease),
+    sex = first_non_na(d$sex),
+    age = first_non_na(d$age),
+    PMI = first_non_na(d$PMI),
+    n_cells = nrow(d),
+    stringsAsFactors = FALSE
+  )
+  for (nm in names(features)) row[[nm]] <- mean_no_na(d[[nm]])
+  row
+}))
+donor_scores <- donor_scores[
+  donor_scores$disease %in% c("HC", "AD") &
+    donor_scores$sex %in% c("female", "male") &
+    !is.na(donor_scores$age) &
+    !is.na(donor_scores$PMI),
+  ,
+  drop = FALSE
+]
+donor_scores$disease <- factor(donor_scores$disease, levels = c("HC", "AD"))
+donor_scores$sex <- factor(donor_scores$sex, levels = c("female", "male"))
+donor_scores$age_z <- as.numeric(scale(donor_scores$age))
+donor_scores$PMI_z <- as.numeric(scale(donor_scores$PMI))
+write.csv(donor_scores, file.path(out_dir, "Supplymentary1_leading_UCell_donor_scores.csv"), row.names = FALSE)
+
+message("Fitting linear models...")
+modules <- names(features)
+res <- list()
+
+ad <- donor_scores[donor_scores$disease == "AD", , drop = FALSE]
+ad$sex <- factor(ad$sex, levels = c("female", "male"))
+for (m in modules) {
+  res[[length(res) + 1]] <- fit_one(ad, m, "AD_male_vs_female", "sex", c("age_z", "PMI_z"), "sex", "female", "male")
+}
+
+hc <- donor_scores[donor_scores$disease == "HC", , drop = FALSE]
+hc$sex <- factor(hc$sex, levels = c("female", "male"))
+for (m in modules) {
+  res[[length(res) + 1]] <- fit_one(hc, m, "HC_male_vs_female", "sex", c("age_z", "PMI_z"), "sex", "female", "male")
+}
+
+all_dat <- donor_scores
+all_dat$disease <- factor(all_dat$disease, levels = c("HC", "AD"))
+all_dat$sex <- factor(all_dat$sex, levels = c("female", "male"))
+for (m in modules) {
+  res[[length(res) + 1]] <- fit_one(all_dat, m, "AD_vs_HC_all_sexes", "disease", c("sex", "age_z", "PMI_z"), "disease", "HC", "AD")
+}
+
+female <- donor_scores[donor_scores$sex == "female", , drop = FALSE]
+female$disease <- factor(female$disease, levels = c("HC", "AD"))
+for (m in modules) {
+  res[[length(res) + 1]] <- fit_one(female, m, "AD_vs_HC_female_only", "disease", c("age_z", "PMI_z"), "disease", "HC", "AD")
+}
+
+male <- donor_scores[donor_scores$sex == "male", , drop = FALSE]
+male$disease <- factor(male$disease, levels = c("HC", "AD"))
+for (m in modules) {
+  res[[length(res) + 1]] <- fit_one(male, m, "AD_vs_HC_male_only", "disease", c("age_z", "PMI_z"), "disease", "HC", "AD")
+}
+
+results <- do.call(rbind, res)
+results$q <- ave(results$p, results$comparison, FUN = function(p) p.adjust(p, method = "BH"))
+results$mean_diff_group_b_minus_a <- results$mean_group_b - results$mean_group_a
+results <- results[order(results$comparison, results$q, results$p), ]
+
+write.csv(results, file.path(out_dir, "Supplymentary1_leading_UCell_linear_model_results.csv"), row.names = FALSE)
+
+rounded <- results
+num_cols <- vapply(rounded, is.numeric, logical(1))
+rounded[num_cols] <- lapply(rounded[num_cols], function(x) round(x, 4))
+write.csv(rounded, file.path(out_dir, "Supplymentary1_leading_UCell_linear_model_results_rounded.csv"), row.names = FALSE)
+
+message("Done.")
+message("Output dir: ", out_dir)
