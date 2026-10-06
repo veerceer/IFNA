@@ -1,0 +1,214 @@
+## 01_score.R : cell-level gene-set scores (AddModuleScore, UCell, Pearson residuals)
+## Run from the folder that contains the input files, or edit the paths below.
+suppressPackageStartupMessages({
+  library(Seurat); library(SeuratObject); library(UCell)
+  library(Matrix); library(readxl); library(dplyr)
+})
+source("functions.R")
+
+rds_path  <- "ROSMAP_pericyte_rds.bak"                    # readRDS() detects gzip regardless of extension
+xlsx_path <- "Figure4_leading_UCell_LM_results.xlsx"
+out_dir   <- "output"; dir.create(out_dir, showWarnings = FALSE)
+
+obj <- readRDS(rds_path)
+DefaultAssay(obj) <- "RNA"
+obj <- tryCatch(JoinLayers(obj), error = function(e) obj)   # Seurat v5: merge counts.1/data.1 -> counts/data
+
+## ---- leading-edge gene sets ("Genes used" sheet: columns module, gene) ----
+gs <- read_excel(xlsx_path, sheet = "Genes used")
+modules <- list(
+  IFNA            = gs$gene[gs$module == "INTERFERON_ALPHA_RESPONSE"],
+  MYC_TARGETS_V2  = gs$gene[gs$module == "MYC_TARGETS_V2"],
+  G2M_CHECKPOINT  = gs$gene[gs$module == "G2M_CHECKPOINT"],
+  MITOTIC_SPINDLE = gs$gene[gs$module == "MITOTIC_SPINDLE"])
+print(sapply(modules, length))                              # expected 35, 20, 55, 80
+stopifnot(all(unlist(modules) %in% rownames(obj)))
+stopifnot(length(intersect(modules$IFNA, unlist(modules[-1]))) == 0)
+
+counts <- LayerData(obj, assay = "RNA", layer = "counts")   # Seurat < 5: GetAssayData(obj, slot = "counts")
+md <- obj@meta.data
+need <- c("donor_id", "disease_std", "sex_std", "age_analysis", "pmi_hours_analysis", "nCount_RNA", "percent.mt")
+stopifnot(all(need %in% colnames(md)))
+
+cell_df <- data.frame(
+  cell = colnames(obj),
+  donor_id = as.character(md$donor_id),
+  disease  = as.character(md$disease_std),
+  sex      = as.character(md$sex_std),
+  age      = as.numeric(as.character(md$age_analysis)),
+  pmi      = as.numeric(as.character(md$pmi_hours_analysis)),
+  nCount_RNA = md$nCount_RNA,
+  percent.mt = md$percent.mt,
+  total_counts = Matrix::colSums(counts),
+  stringsAsFactors = FALSE)
+cell_df$lognC <- log(cell_df$nCount_RNA)
+
+## ---- 1. AddModuleScore (Seurat defaults used here: 24 bins, 100 control genes per gene) ----
+for (nm in names(modules)) {
+  obj <- AddModuleScore(obj, features = list(modules[[nm]]), nbin = 24, ctrl = 100,
+                        name = paste0("AMS_", nm, "_"), seed = 1)
+  cell_df[[paste0("AMS_", nm)]] <- obj@meta.data[[paste0("AMS_", nm, "_1")]]
+}
+
+## ---- 2. UCell (maxRank = 1500) ----
+uc <- UCell::ScoreSignatures_UCell(counts, features = modules, maxRank = 1500)   # cells x signatures, colnames "<name>_UCell"
+for (nm in names(modules)) cell_df[[paste0("UCell_", nm)]] <- uc[cell_df$cell, paste0(nm, "_UCell")]
+
+## ---- 3. analytic Pearson-residual score (counts based) ----
+for (nm in names(modules)) cell_df[[paste0("PR_", nm)]] <- pearson_resid_score(counts, modules[[nm]])[cell_df$cell]
+
+saveRDS(cell_df, file.path(out_dir, "cell_scores.rds"))
+saveRDS(modules, file.path(out_dir, "modules.rds"))
+saveRDS(obj,     file.path(out_dir, "obj_scored.rds"))      # optional; used by 02_stats.R for the random gene-set null
+message("done: ", nrow(cell_df), " cells, ", length(unique(cell_df$donor_id)), " donors")
+
+## 02_stats.R : donor-level partial correlations for the 7 strata + robustness + random gene-set null
+suppressPackageStartupMessages({library(Seurat); library(Matrix); library(dplyr)})
+source("functions.R")
+out_dir <- "output"
+B <- 300                                                      # random gene sets per module
+
+cell_df <- readRDS(file.path(out_dir, "cell_scores.rds"))
+modules <- readRDS(file.path(out_dir, "modules.rds"))
+obj     <- readRDS(file.path(out_dir, "obj_scored.rds"))
+counts  <- LayerData(obj, assay = "RNA", layer = "counts")
+gm      <- Matrix::rowMeans(LayerData(obj, assay = "RNA", layer = "data"))   # mean log-normalised expression per gene
+
+score_cols <- grep("^(AMS|UCell|PR)_", colnames(cell_df), value = TRUE)
+dt     <- build_donor_table(cell_df, score_cols)              # sorted by donor_id
+strata <- make_strata(dt)
+Zall   <- as.matrix(dt[, cov_cols])
+
+pc <- function(mod, type, mask, method) {                     # donor-level partial correlation of <type>_<mod> vs <type>_IFNA
+  partial_cor(dt[[paste0(type, "_", mod)]][mask], dt[[paste0(type, "_IFNA")]][mask], Zall[mask, , drop = FALSE], method)
+}
+cellpc <- function(mod, mask_donors, type = "AMS") {          # cell-level partial Spearman (UMI count, mito fraction)
+  cc <- cell_df[cell_df$donor_id %in% dt$donor_id[mask_donors], ]
+  partial_cor(cc[[paste0(type, "_", mod)]], cc[[paste0(type, "_IFNA")]], as.matrix(cc[, c("lognC", "percent.mt")]), "spearman")
+}
+
+all_res <- list()
+for (mod in c("MITOTIC_SPINDLE", "G2M_CHECKPOINT", "MYC_TARGETS_V2")) {
+  message("== ", mod)
+  ## ---- random expression-matched gene sets (same size as the module) ----
+  rs <- random_matched_sets(modules[[mod]], c(modules[[mod]], modules$IFNA), gm, nbin = 24, B = B)
+  obj <- AddModuleScore(obj, features = rs, nbin = 24, ctrl = 100, name = "RND", seed = 1)
+  rnd_cols <- paste0("RND", seq_len(B))
+  rnd_ams_cell <- as.matrix(obj@meta.data[, rnd_cols])
+  obj@meta.data[, rnd_cols] <- NULL
+  rnd_pr_cell <- sapply(rs, function(g) pearson_resid_score(counts, g))      # cells x B
+  donor_mean <- function(M) { M <- rowsum(M, cell_df$donor_id); M[dt$donor_id, , drop = FALSE] / dt$ncell }
+  rnd_ams <- donor_mean(rnd_ams_cell); rnd_pr <- donor_mean(rnd_pr_cell)
+
+  rows <- lapply(names(strata), function(sn) {
+    m <- strata[[sn]]
+    main <- pc(mod, "AMS", m, "pearson")
+    sA <- pc(mod, "AMS", m, "spearman"); sP <- pc(mod, "PR", m, "spearman"); sU <- pc(mod, "UCell", m, "spearman")
+    cl <- cellpc(mod, m)
+    nullA <- apply(rnd_ams[m, , drop = FALSE], 2, function(v) partial_cor(v, dt$AMS_IFNA[m], Zall[m, , drop = FALSE], "spearman")$r)
+    nullP <- apply(rnd_pr[m,  , drop = FALSE], 2, function(v) partial_cor(v, dt$PR_IFNA[m],  Zall[m, , drop = FALSE], "spearman")$r)
+    data.frame(module = mod, stratum = sn, n = main$n, n_covariates = main$k,
+               AMS_pearson_r = main$r, CI_lo = main$lo, CI_hi = main$hi, AMS_pearson_p = main$p,
+               AMS_spearman_r = sA$r, AMS_spearman_p = sA$p, PR_spearman_r = sP$r, PR_spearman_p = sP$p,
+               UCell_spearman_r = sU$r, UCell_spearman_p = sU$p,
+               cell_n = cl$n, cell_partial_r = cl$r, cell_partial_p = cl$p,
+               null_mean_AMS = mean(nullA), AMS_emp_p_neg = (1 + sum(nullA <= sA$r)) / (B + 1),
+               null_mean_PR  = mean(nullP), PR_emp_p_neg  = (1 + sum(nullP <= sP$r)) / (B + 1))
+  })
+  res <- do.call(rbind, rows)
+  res$AMS_pearson_q <- p.adjust(res$AMS_pearson_p, method = "BH")          # BH across the 7 strata of this module
+  write.csv(res, file.path(out_dir, paste0("results_", mod, "_vs_IFNA.csv")), row.names = FALSE)
+  all_res[[mod]] <- res
+}
+print(do.call(rbind, all_res)[, c("module", "stratum", "n", "AMS_pearson_r", "AMS_pearson_p", "AMS_pearson_q")])
+saveRDS(dt, file.path(out_dir, "donor_table.rds"))
+
+
+
+## Helper functions shared by 02_stats.R and 03_plots.R ---------------------
+
+suppressPackageStartupMessages(library(dplyr))
+
+## drop covariates that are constant inside a stratum
+drop_const <- function(Z) {
+  Z <- as.matrix(Z)
+  if (ncol(Z) == 0) return(Z)
+  keep <- apply(Z, 2, function(v) length(unique(v[!is.na(v)])) > 1)
+  Z[, keep, drop = FALSE]
+}
+
+## partial correlation of x and y given covariates Z
+##   method = "pearson"  : residualise x and y on Z, Pearson r of the residuals (main analysis)
+##   method = "spearman" : rank-transform x and y first, then the same
+## df = n - k - 2 (k = number of non-constant covariates); 95% CI by Fisher z with se = 1/sqrt(df - 1)
+partial_cor <- function(x, y, Z, method = c("pearson", "spearman")) {
+  method <- match.arg(method)
+  Z  <- drop_const(Z)
+  ok <- complete.cases(Z) & !is.na(x) & !is.na(y)
+  x <- x[ok]; y <- y[ok]; Z <- Z[ok, , drop = FALSE]
+  if (method == "spearman") { x <- rank(x); y <- rank(y) }
+  xr <- if (ncol(Z) > 0) resid(lm(x ~ Z)) else x - mean(x)
+  yr <- if (ncol(Z) > 0) resid(lm(y ~ Z)) else y - mean(y)
+  r  <- cor(xr, yr); k <- ncol(Z); n <- length(x); dfree <- n - k - 2
+  p  <- 2 * pt(-abs(r * sqrt(dfree / (1 - r^2))), dfree)
+  z  <- atanh(r); se <- 1 / sqrt(dfree - 1)
+  list(r = r, p = p, lo = tanh(z - 1.96 * se), hi = tanh(z + 1.96 * se),
+       n = n, k = k, xr = unname(xr), yr = unname(yr), ok = ok)
+}
+
+## analytic Pearson-residual score (counts-based, theta = 100, clipped at +-sqrt(n cells))
+pearson_resid_score <- function(counts, genes, theta = 100) {
+  cs <- Matrix::colSums(counts)
+  pg <- Matrix::rowSums(counts) / sum(cs)
+  X  <- as.matrix(counts[genes, , drop = FALSE])
+  mu <- outer(pg[genes], cs)
+  Rr <- (X - mu) / sqrt(mu + mu^2 / theta)
+  cl <- sqrt(ncol(counts))
+  Rr[Rr >  cl] <-  cl
+  Rr[Rr < -cl] <- -cl
+  colMeans(Rr)
+}
+
+## donor-level table: donor means of every score column + covariates
+## cell_df needs: donor_id, disease, sex, age, pmi, total_counts and the score columns
+build_donor_table <- function(cell_df, score_cols) {
+  meta <- cell_df %>% group_by(donor_id) %>%
+    summarise(disease = first(disease), sex = first(sex), age = first(age), pmi = first(pmi),
+              ncell = n(), tot = sum(total_counts), .groups = "drop") %>%
+    arrange(donor_id)
+  sc <- cell_df %>% group_by(donor_id) %>%
+    summarise(across(all_of(score_cols), mean), .groups = "drop") %>% arrange(donor_id)
+  dt <- left_join(meta, sc, by = "donor_id")
+  dt$male   <- as.numeric(dt$sex == "male")
+  dt$ad     <- as.numeric(dt$disease == "AD")
+  dt$lognc  <- log(dt$ncell)
+  dt$logtot <- log(dt$tot)
+  dt
+}
+cov_cols <- c("age", "pmi", "male", "ad", "lognc", "logtot")
+
+make_strata <- function(dt) list(
+  "All donors" = rep(TRUE, nrow(dt)),
+  "HC donors"  = dt$disease == "HC",
+  "AD donors"  = dt$disease == "AD",
+  "HC male"    = dt$disease == "HC" & dt$sex == "male",
+  "HC female"  = dt$disease == "HC" & dt$sex == "female",
+  "AD male"    = dt$disease == "AD" & dt$sex == "male",
+  "AD female"  = dt$disease == "AD" & dt$sex == "female")
+
+## expression-matched random gene sets: one random gene from the same expression bin for every gene
+random_matched_sets <- function(genes, exclude, gm, nbin = 24, B = 300, seed = 2024) {
+  set.seed(seed)
+  ord <- order(gm)
+  bin_id <- cut(seq_along(ord), nbin, labels = FALSE)
+  members <- split(names(gm)[ord], bin_id)
+  bin_of  <- setNames(bin_id, names(gm)[ord])
+  lapply(seq_len(B), function(b) {
+    ch <- character(0)
+    for (g in genes) {
+      cand <- setdiff(members[[bin_of[[g]]]], c(exclude, ch))
+      ch <- c(ch, sample(cand, 1))
+    }
+    ch
+  })
+}
