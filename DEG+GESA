@@ -1,0 +1,371 @@
+Sys.setenv(R_USER_CACHE_DIR = "C:/Users/veerc/Documents/Review/Rcache")
+.libPaths(c("C:/Users/veerc/Documents/Review/Rlib", .libPaths()))
+
+suppressPackageStartupMessages({
+  library(SeuratObject)
+  library(Matrix)
+  library(edgeR)
+  library(limma)
+  library(nebula)
+  library(fgsea)
+  library(data.table)
+})
+
+set.seed(1)
+
+base_dir <- "C:/Users/veerc/Desktop/IFNA/DATA"
+work_dir <- "C:/Users/veerc/Documents/Review"
+hallmark_file <- file.path(work_dir, "hallmark_msigdbr_human_2026.1.rds")
+go_file <- file.path(work_dir, "Rcache", "R", "msigdbr", "msigdb.2026.1.Hs.C5.rds")
+if (!file.exists(go_file)) {
+  go_file <- file.path(work_dir, "R_cache", "R", "msigdbr", "msigdb.2026.1.Hs.C5.rds")
+}
+out_root <- file.path(work_dir, "pericyte_AD_sex_interaction_four_models_two_methods")
+dir.create(out_root, recursive = TRUE, showWarnings = FALSE)
+
+datasets <- list(
+  ROSMAP = file.path(base_dir, "ROSMAP_pericyte.rds"),
+  Yang = file.path(base_dir, "saarland_pericyte.rds")
+)
+
+model_specs <- list(
+  unadjusted = character(0),
+  `+age` = "age_analysis",
+  `+PMI` = "pmi_hours_analysis",
+  `+age+PMI` = c("age_analysis", "pmi_hours_analysis")
+)
+
+write_tsv <- function(x, file) {
+  data.table::fwrite(as.data.frame(x), file = file, sep = "\t", quote = FALSE, na = "NA")
+}
+
+get_counts <- function(obj) {
+  tryCatch(
+    SeuratObject::LayerData(obj, assay = "RNA", layer = "counts"),
+    error = function(e) SeuratObject::GetAssayData(obj, assay = "RNA", slot = "counts")
+  )
+}
+
+clean_stats <- function(stats) {
+  stats <- stats[is.finite(stats)]
+  stats <- stats[!is.na(names(stats)) & names(stats) != ""]
+  stats <- stats[!duplicated(names(stats))]
+  sort(stats, decreasing = TRUE)
+}
+
+load_msigdb_sets <- function(file, collection_label, go_only = FALSE) {
+  if (!file.exists(file)) stop("MSigDB file not found: ", file)
+  msig <- as.data.frame(readRDS(file))
+  gene_col <- intersect(c("gene_symbol", "human_gene_symbol", "gene_name"), colnames(msig))[1]
+  set_col <- intersect(c("gs_name", "geneset", "pathway"), colnames(msig))[1]
+  if (is.na(gene_col) || is.na(set_col)) {
+    stop(collection_label, " MSigDB file lacks recognizable gene set columns: ",
+         paste(colnames(msig), collapse = ", "))
+  }
+
+  if (go_only) {
+    keep <- grepl("^(GOBP|GOMF|GOCC|GO)_", msig[[set_col]])
+    if ("gs_subcollection" %in% colnames(msig)) {
+      keep <- keep | grepl("^GO", msig$gs_subcollection)
+    }
+    msig <- msig[keep, , drop = FALSE]
+  }
+
+  sets <- split(msig[[gene_col]], msig[[set_col]])
+  sets <- lapply(sets, unique)
+  sets[lengths(sets) > 0]
+}
+
+gene_set_collections <- list(
+  Hallmark = load_msigdb_sets(hallmark_file, "Hallmark"),
+  GO = load_msigdb_sets(go_file, "GO", go_only = TRUE)
+)
+
+run_msigdb_gsea <- function(stats, out_prefix) {
+  stats <- clean_stats(stats)
+  rank_tbl <- data.frame(
+    gene = names(stats),
+    rank_stat = as.numeric(stats),
+    direction = ifelse(stats > 0, "AD_effect_stronger_in_female", "AD_effect_stronger_in_male"),
+    stringsAsFactors = FALSE
+  )
+  write_tsv(rank_tbl, paste0(out_prefix, "_ranked_gene_list.tsv"))
+
+  gsea_list <- lapply(names(gene_set_collections), function(collection) {
+    gsea <- fgsea(
+      pathways = gene_set_collections[[collection]],
+      stats = stats,
+      minSize = 10,
+      maxSize = 500,
+      eps = 0,
+      nproc = 1
+    )
+    gsea <- as.data.frame(gsea)
+    if (nrow(gsea) > 0) {
+      gsea$leadingEdge <- vapply(gsea$leadingEdge, paste, collapse = ";", FUN.VALUE = character(1))
+      gsea <- gsea[order(gsea$padj, -abs(gsea$NES)), ]
+    }
+    gsea$collection <- collection
+    write_tsv(gsea, paste0(out_prefix, "_", collection, "_GSEA_all.tsv"))
+    gsea
+  })
+  names(gsea_list) <- names(gene_set_collections)
+
+  gsea <- data.table::rbindlist(gsea_list, fill = TRUE)
+  write_tsv(gsea, paste0(out_prefix, "_MSigDB_GSEA_all.tsv"))
+  list(gsea = as.data.frame(gsea), n_ranked_genes = length(stats))
+}
+
+build_formula <- function(covariates) {
+  as.formula(paste("~", paste(c("disease * sex", covariates), collapse = " + ")))
+}
+
+interaction_coef_name <- function(design) {
+  candidates <- c("diseaseAD:sexmale", "sexmale:diseaseAD")
+  hit <- intersect(candidates, colnames(design))
+  if (length(hit) == 0) {
+    stop("Interaction coefficient not found. Design columns: ", paste(colnames(design), collapse = ", "))
+  }
+  hit[[1]]
+}
+
+prepare_cell_data <- function(obj, dataset_name) {
+  md <- obj@meta.data
+  counts <- get_counts(obj)
+  md <- md[colnames(counts), , drop = FALSE]
+
+  required <- c("donor_id", "disease_std", "sex_std", "age_analysis", "pmi_hours_analysis")
+  missing <- setdiff(required, colnames(md))
+  if (length(missing) > 0) {
+    stop(dataset_name, " missing metadata columns: ", paste(missing, collapse = ", "))
+  }
+
+  md$donor_id <- as.character(md$donor_id)
+  md$disease <- factor(as.character(md$disease_std), levels = c("HC", "AD"))
+  md$sex <- factor(as.character(md$sex_std), levels = c("female", "male"))
+  md$age_analysis <- as.numeric(md$age_analysis)
+  md$pmi_hours_analysis <- as.numeric(md$pmi_hours_analysis)
+
+  keep <- !is.na(md$donor_id) &
+    !is.na(md$disease) &
+    !is.na(md$sex) &
+    !is.na(md$age_analysis) &
+    !is.na(md$pmi_hours_analysis) &
+    Matrix::colSums(counts) > 0
+
+  md <- md[keep, , drop = FALSE]
+  counts <- counts[, keep, drop = FALSE]
+  list(counts = counts, meta = md)
+}
+
+pseudobulk_by_donor <- function(counts, md) {
+  donor <- factor(md$donor_id)
+  design <- Matrix::sparse.model.matrix(~ 0 + donor)
+  colnames(design) <- levels(donor)
+  pb_counts <- counts %*% design
+
+  sample_info <- unique(md[, c("donor_id", "disease", "sex", "age_analysis", "pmi_hours_analysis"), drop = FALSE])
+  sample_info <- sample_info[match(colnames(pb_counts), sample_info$donor_id), , drop = FALSE]
+  sample_info$n_cells <- as.integer(table(donor)[sample_info$donor_id])
+  rownames(sample_info) <- sample_info$donor_id
+
+  list(counts = pb_counts, sample_info = sample_info)
+}
+
+run_pseudobulk <- function(pb_counts, sample_info, dataset_name, model_label, covariates) {
+  out_dir <- file.path(out_root, dataset_name, "pseudobulk", make.names(model_label))
+  dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+  design <- model.matrix(build_formula(covariates), data = sample_info)
+  coef_name <- interaction_coef_name(design)
+
+  y <- edgeR::DGEList(counts = pb_counts, samples = sample_info)
+  keep <- edgeR::filterByExpr(y, design = design, min.count = 5)
+  if (sum(keep) < 100) keep <- Matrix::rowSums(pb_counts) > 0
+  y <- y[keep, , keep.lib.sizes = FALSE]
+  y <- edgeR::calcNormFactors(y, method = "TMM")
+  v <- limma::voom(y, design, plot = FALSE)
+  fit <- limma::eBayes(limma::lmFit(v, design))
+
+  tab <- limma::topTable(fit, coef = coef_name, number = Inf, sort.by = "none")
+  coef_index <- match(coef_name, colnames(fit$coefficients))
+  interaction_se <- sqrt(fit$s2.post) * fit$stdev.unscaled[, coef_index]
+  tab$gene <- rownames(tab)
+  tab$dataset <- dataset_name
+  tab$method <- "pseudobulk_limma_voom"
+  tab$model_label <- model_label
+  tab$model <- paste(deparse(build_formula(covariates)), collapse = "")
+  tab$coef <- coef_name
+  tab$interaction_logFC_male_vs_female <- fit$coefficients[tab$gene, coef_index]
+  tab$interaction_se <- interaction_se[tab$gene]
+  tab$interaction_z_male_vs_female <- tab$interaction_logFC_male_vs_female / tab$interaction_se
+  tab$interaction_z_female_vs_male <- -tab$interaction_z_male_vs_female
+  tab$rank_stat <- tab$interaction_z_female_vs_male
+  tab$rank_direction <- "positive=AD_effect_stronger_in_female_relative_to_male"
+  tab <- tab[, c("dataset", "method", "model_label", "model", "gene", "coef",
+                 "interaction_logFC_male_vs_female", "interaction_se", "interaction_z_male_vs_female",
+                 "interaction_z_female_vs_male", "rank_stat", "rank_direction",
+                 setdiff(colnames(tab), c("dataset", "method", "model_label", "model", "gene", "coef",
+                                           "interaction_logFC_male_vs_female", "interaction_se", "interaction_z_male_vs_female",
+                                           "interaction_z_female_vs_male", "rank_stat", "rank_direction")))]
+
+  write_tsv(tab, file.path(out_dir, paste0(dataset_name, "_", make.names(model_label), "_pseudobulk_limma_voom_interaction.tsv")))
+  gsea <- run_msigdb_gsea(
+    setNames(tab$rank_stat, tab$gene),
+    file.path(out_dir, paste0(dataset_name, "_", make.names(model_label), "_pseudobulk_limma_voom"))
+  )
+
+  list(de = tab, gsea = gsea$gsea, n_ranked_genes = gsea$n_ranked_genes)
+}
+
+run_nebula_model <- function(counts, md, dataset_name, model_label, covariates) {
+  out_dir <- file.path(out_root, dataset_name, "nebula", make.names(model_label))
+  dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+  keep_gene <- Matrix::rowSums(counts > 0) >= 20
+  counts <- counts[keep_gene, , drop = FALSE]
+
+  pred <- model.matrix(build_formula(covariates), data = md)
+  coef_name <- interaction_coef_name(pred)
+  logfc_col <- paste0("logFC_", coef_name)
+  se_col <- paste0("se_", coef_name)
+  p_col <- paste0("p_", coef_name)
+
+  offset <- Matrix::colSums(counts)
+  offset[offset <= 0 | !is.finite(offset)] <- 1
+
+  grouped <- nebula::group_cell(count = counts, id = md$donor_id, pred = pred, offset = offset)
+  if (is.null(grouped)) {
+    grouped <- list(count = counts, id = md$donor_id, pred = pred, offset = offset)
+  }
+
+  nb <- nebula::nebula(
+    count = grouped$count,
+    id = grouped$id,
+    pred = grouped$pred,
+    offset = grouped$offset,
+    model = "NBGMM",
+    method = "LN",
+    cutoff_cell = 20,
+    ncore = 4,
+    verbose = TRUE
+  )
+
+  tab <- as.data.frame(nb$summary)
+  if ("gene_id" %in% colnames(tab)) {
+    gene_idx <- suppressWarnings(as.integer(as.character(tab$gene_id)))
+    tab$gene <- rownames(counts)[gene_idx]
+  } else if (!"gene" %in% colnames(tab)) {
+    tab$gene <- rownames(tab)
+  }
+
+  if (!all(c(logfc_col, se_col, p_col) %in% colnames(tab))) {
+    stop("Nebula output missing interaction columns for ", coef_name,
+         ". Columns: ", paste(colnames(tab), collapse = ", "))
+  }
+
+  tab$dataset <- dataset_name
+  tab$method <- "nebula_NBGMM"
+  tab$model_label <- model_label
+  tab$model <- paste(deparse(build_formula(covariates)), collapse = "")
+  tab$coef <- coef_name
+  tab$interaction_logFC_male_vs_female <- tab[[logfc_col]]
+  tab$interaction_se <- tab[[se_col]]
+  tab$interaction_z_male_vs_female <- tab$interaction_logFC_male_vs_female / tab$interaction_se
+  tab$interaction_z_female_vs_male <- -tab$interaction_z_male_vs_female
+  tab$interaction_p <- tab[[p_col]]
+  tab$interaction_fdr <- p.adjust(tab$interaction_p, method = "BH")
+  tab$rank_stat <- tab$interaction_z_female_vs_male
+  tab$rank_direction <- "positive=AD_effect_stronger_in_female_relative_to_male"
+  tab <- tab[, c("dataset", "method", "model_label", "model", "gene", "coef",
+                 "interaction_logFC_male_vs_female", "interaction_se",
+                 "interaction_z_male_vs_female", "interaction_z_female_vs_male",
+                 "interaction_p", "interaction_fdr", "rank_stat", "rank_direction",
+                 setdiff(colnames(tab), c("dataset", "method", "model_label", "model", "gene", "coef",
+                                           "interaction_logFC_male_vs_female", "interaction_se",
+                                           "interaction_z_male_vs_female", "interaction_z_female_vs_male",
+                                           "interaction_p", "interaction_fdr", "rank_stat", "rank_direction")))]
+
+  write_tsv(tab, file.path(out_dir, paste0(dataset_name, "_", make.names(model_label), "_nebula_interaction.tsv")))
+  gsea <- run_msigdb_gsea(
+    setNames(tab$rank_stat, tab$gene),
+    file.path(out_dir, paste0(dataset_name, "_", make.names(model_label), "_nebula"))
+  )
+
+  list(de = tab, gsea = gsea$gsea, n_ranked_genes = gsea$n_ranked_genes)
+}
+
+all_gsea <- list()
+run_summary <- list()
+
+for (dataset_name in names(datasets)) {
+  message("\n=== Dataset: ", dataset_name, " ===")
+  obj <- readRDS(datasets[[dataset_name]])
+  prepared <- prepare_cell_data(obj, dataset_name)
+  rm(obj)
+  gc()
+
+  counts <- prepared$counts
+  md <- prepared$meta
+  pb <- pseudobulk_by_donor(counts, md)
+
+  dataset_dir <- file.path(out_root, dataset_name)
+  dir.create(dataset_dir, recursive = TRUE, showWarnings = FALSE)
+
+  cell_summary <- as.data.frame(table(md$disease, md$sex, useNA = "ifany"))
+  colnames(cell_summary) <- c("disease", "sex", "n_cells")
+  write_tsv(cell_summary, file.path(dataset_dir, paste0(dataset_name, "_cell_summary.tsv")))
+
+  donor_info <- unique(md[, c("donor_id", "disease", "sex", "age_analysis", "pmi_hours_analysis"), drop = FALSE])
+  donor_counts <- as.data.frame(table(md$donor_id))
+  colnames(donor_counts) <- c("donor_id", "n_cells")
+  donor_info <- merge(donor_info, donor_counts, by = "donor_id", all.x = TRUE)
+  donor_info <- donor_info[order(donor_info$disease, donor_info$sex, donor_info$donor_id), ]
+  write_tsv(donor_info, file.path(dataset_dir, paste0(dataset_name, "_donor_metadata.tsv")))
+
+  for (model_label in names(model_specs)) {
+    covariates <- model_specs[[model_label]]
+    message("Running ", dataset_name, " pseudobulk model: ", model_label)
+    pb_res <- run_pseudobulk(pb$counts, pb$sample_info, dataset_name, model_label, covariates)
+    pb_gsea <- pb_res$gsea
+    pb_gsea$dataset <- dataset_name
+    pb_gsea$method <- "pseudobulk_limma_voom"
+    pb_gsea$model_label <- model_label
+    all_gsea[[paste(dataset_name, "pseudobulk", model_label, sep = "_")]] <- pb_gsea
+
+    message("Running ", dataset_name, " nebula model: ", model_label)
+    nb_res <- run_nebula_model(counts, md, dataset_name, model_label, covariates)
+    nb_gsea <- nb_res$gsea
+    nb_gsea$dataset <- dataset_name
+    nb_gsea$method <- "nebula_NBGMM"
+    nb_gsea$model_label <- model_label
+    all_gsea[[paste(dataset_name, "nebula", model_label, sep = "_")]] <- nb_gsea
+
+    run_summary[[paste(dataset_name, model_label, sep = "_")]] <- data.frame(
+      dataset = dataset_name,
+      model_label = model_label,
+      covariates = paste(covariates, collapse = ","),
+      n_cells = ncol(counts),
+      n_donors = length(unique(md$donor_id)),
+      n_genes_input = nrow(counts),
+      pseudobulk_n_ranked_genes = pb_res$n_ranked_genes,
+      nebula_n_ranked_genes = nb_res$n_ranked_genes,
+      stringsAsFactors = FALSE
+    )
+  }
+}
+
+combined_gsea <- data.table::rbindlist(all_gsea, fill = TRUE)
+data.table::setcolorder(
+  combined_gsea,
+  c("dataset", "method", "model_label", setdiff(colnames(combined_gsea), c("dataset", "method", "model_label")))
+)
+write_tsv(combined_gsea, file.path(out_root, "pericyte_AD_sex_interaction_four_models_two_methods_MSigDB_GSEA_all.tsv"))
+
+summary_df <- data.table::rbindlist(run_summary, fill = TRUE)
+write_tsv(summary_df, file.path(out_root, "pericyte_AD_sex_interaction_four_models_two_methods_run_summary.tsv"))
+
+ifna <- combined_gsea[pathway == "HALLMARK_INTERFERON_ALPHA_RESPONSE"]
+write_tsv(ifna, file.path(out_root, "pericyte_AD_sex_interaction_four_models_two_methods_IFNA_Hallmark.tsv"))
+
+message("Done. Output: ", out_root)
