@@ -1,1 +1,61 @@
+library(limma)
+library(Seurat)
+library(dplyr)
+library(magrittr)
+library(celldex)
+library(SingleR)
+library(monocle)
+library(clustree)
+library(harmony)
 
+library(readxl)
+logFCfilter=1          
+adjPvalFilter=0.05    
+
+workDir <- "C:/Users/veerc/Desktop/IFNA"
+setwd(workDir)
+
+
+dirs=list.dirs(workDir)
+dirs_sample=dirs[-1]
+names(dirs_sample)=gsub(".+\\/(.+)", "\\1", dirs_sample)
+counts <- Read10X(data.dir = dirs_sample)
+seu = CreateSeuratObject(counts, min.cells=50, min.features=200)
+
+seu[["percent.mt"]] <- PercentageFeatureSet(object = seu, pattern = "^MT-")
+pdf(file="01.featureViolin.pdf", width=10, height=6.5)
+VlnPlot(object = seu, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol=3)
+dev.off()
+seu <- subset(seu, subset = nFeature_RNA > 200 & nFeature_RNA < 6000 & percent.mt < 5)
+
+seu <- NormalizeData(object=seu, normalization.method="LogNormalize", scale.factor=10000)
+seu <- FindVariableFeatures(object=seu, selection.method="vst", nfeatures=3000)
+seu =ScaleData(seu)       
+seu=RunPCA(object= seu, npcs=20, pc.genes=VariableFeatures(object=seu))     
+seu=RunHarmony(seu, "orig.ident")
+
+seu <- JackStraw(object=seu, num.replicate=100)
+seu <- ScoreJackStraw(object = seu, dims = 1:20)
+JackStrawPlot(object=seu, dims=1:20)
+ElbowPlot(seu)
+
+pcSelect=20
+seu <- FindNeighbors(seu, reduction = "harmony", dims = 1:pcSelect)
+seu <- FindClusters(seu, resolution = 0.5)
+seu <- RunUMAP(seu, reduction = "harmony", dims = 1:pcSelect)      
+DimPlot(seu, reduction = "umap", pt.size = 2, label = TRUE)
+
+write.table(seu$seurat_clusters,file="03.Cluster.txt",quote=F,sep="\t",col.names=F)
+seu.markers <- FindAllMarkers(object = seu,
+                               only.pos = FALSE,
+                               min.pct = 0.25,
+                               logfc.threshold = 0.25)
+sig.markers <- seu.markers[
+  abs(seu.markers$avg_log2FC) > logFCfilter &
+    seu.markers$p_val_adj < adjPvalFilter,
+]
+write.table(seu.markers,file="03.clusterMarkers.xls",sep="\t",row.names=F,quote=F)
+top10 <- seu.markers %>% group_by(cluster) %>% top_n(n = 10, wt = avg_log2FC)
+
+
+dev.off()
