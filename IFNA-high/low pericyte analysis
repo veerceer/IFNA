@@ -1,0 +1,1184 @@
+libPaths(c("C:/Users/veerc/Documents/Review/Rlib", .libPaths()))
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(UCell)
+  library(dplyr)
+  library(clusterProfiler)
+  library(org.Hs.eg.db)
+})
+
+data_file <- "C:/Users/veerc/Desktop/IFNA/DATA/ROSMAP_pericyte.rds"
+out_dir <- "C:/Users/veerc/Documents/Review/ROSMAP_LE35_user_code_MAST_GOBP"
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+ROSMAP_pericyte <- readRDS(data_file)
+if ("RNA" %in% Assays(ROSMAP_pericyte)) DefaultAssay(ROSMAP_pericyte) <- "RNA"
+
+ifna_leading_genes <- c(
+  "OAS1", "HERC6", "LPAR6", "GBP4", "C1S", "CNP", "IFIT3", "PNPT1",
+  "CMTR1", "ISG15", "TMEM140", "IFI44L", "EPSTI1", "OGFR",
+  "TXNIP", "GMPR", "MX1", "PARP14", "IFITM2", "DHX58",
+  "PSMA3", "PARP9", "UBA7", "IFIH1", "PSMB9", "TDRD7",
+  "PSMB8", "PSME2", "PLSCR1", "UBE2L6", "IFI27", "EIF2AK2",
+  "TRIM14", "LGALS3BP", "IRF7"
+)
+
+genes_use <- intersect(ifna_leading_genes, rownames(ROSMAP_pericyte))
+missing_genes <- setdiff(ifna_leading_genes, rownames(ROSMAP_pericyte))
+
+cat("Genes used:", length(genes_use), "\n")
+cat("Missing genes:", paste(missing_genes, collapse = ", "), "\n")
+
+write.table(
+  data.frame(gene = ifna_leading_genes, in_object = ifna_leading_genes %in% rownames(ROSMAP_pericyte)),
+  file.path(out_dir, "ROSMAP_LE35_user_code_genes_used.tsv"),
+  sep = "\t",
+  quote = FALSE,
+  row.names = FALSE
+)
+
+before_cols <- colnames(ROSMAP_pericyte@meta.data)
+rosmap_pericyte <- AddModuleScore_UCell(
+  ROSMAP_pericyte,
+  features = list(IFNA_ROSMAP_LE = genes_use),
+  name = NULL
+)
+
+score_candidates <- colnames(rosmap_pericyte@meta.data)[
+  grepl("IFNA_ROSMAP_LE", colnames(rosmap_pericyte@meta.data))
+]
+write.table(
+  data.frame(score_candidate = score_candidates),
+  file.path(out_dir, "ROSMAP_LE35_user_code_score_columns.tsv"),
+  sep = "\t",
+  quote = FALSE,
+  row.names = FALSE
+)
+
+score_col <- "IFNA_ROSMAP_LE"
+if (!score_col %in% colnames(rosmap_pericyte@meta.data)) {
+  stop("Expected score column IFNA_ROSMAP_LE was not found. Candidates: ", paste(score_candidates, collapse = ", "))
+}
+score <- rosmap_pericyte@meta.data[[score_col]]
+
+q25 <- quantile(score, 0.25, na.rm = TRUE)
+q75 <- quantile(score, 0.75, na.rm = TRUE)
+
+rosmap_pericyte$IFNA_state <- NA
+rosmap_pericyte$IFNA_state[score <= q25] <- "IFNA_low"
+rosmap_pericyte$IFNA_state[score >= q75] <- "IFNA_high"
+
+state_table <- table(rosmap_pericyte$IFNA_state, useNA = "ifany")
+print(state_table)
+
+write.csv(
+  data.frame(
+    cell = colnames(rosmap_pericyte),
+    IFNA_ROSMAP_LE = score,
+    IFNA_state = rosmap_pericyte$IFNA_state
+  ),
+  file.path(out_dir, "ROSMAP_LE35_user_code_scores_and_state.csv"),
+  row.names = FALSE
+)
+write.csv(
+  as.data.frame(state_table),
+  file.path(out_dir, "ROSMAP_LE35_user_code_state_counts.csv"),
+  row.names = FALSE
+)
+
+rosmap_ifna_sub <- subset(
+  rosmap_pericyte,
+  subset = IFNA_state %in% c("IFNA_low", "IFNA_high")
+)
+
+rosmap_ifna_sub$IFNA_state <- factor(
+  rosmap_ifna_sub$IFNA_state,
+  levels = c("IFNA_low", "IFNA_high")
+)
+
+Idents(rosmap_ifna_sub) <- "IFNA_state"
+
+latent_use <- c("nFeature_RNA", "percent.mt")
+latent_use <- latent_use[latent_use %in% colnames(rosmap_ifna_sub@meta.data)]
+print(latent_use)
+
+complete_cells <- complete.cases(rosmap_ifna_sub@meta.data[, latent_use, drop = FALSE])
+rosmap_ifna_sub <- rosmap_ifna_sub[, complete_cells]
+Idents(rosmap_ifna_sub) <- "IFNA_state"
+saveRDS(rosmap_ifna_sub, file.path(out_dir, "ROSMAP_LE35_user_code_low_high_subset_for_MAST.rds"))
+
+de_ifna_mast <- FindMarkers(
+  object = rosmap_ifna_sub,
+  ident.1 = "IFNA_high",
+  ident.2 = "IFNA_low",
+  test.use = "MAST",
+  assay = "RNA",
+  latent.vars = latent_use,
+  logfc.threshold = 0,
+  min.pct = 0.05
+)
+
+de_ifna_mast$gene <- rownames(de_ifna_mast)
+
+de_ifna_mast <- de_ifna_mast %>%
+  arrange(p_val_adj)
+
+write.csv(
+  de_ifna_mast,
+  file.path(out_dir, "ROSMAP_LE35_user_code_MAST_all_genes.csv"),
+  row.names = FALSE
+)
+saveRDS(
+  de_ifna_mast,
+  file.path(out_dir, "ROSMAP_LE35_user_code_MAST_all_genes.rds")
+)
+
+de_ifna_mast_no_module <- de_ifna_mast %>%
+  filter(!gene %in% ifna_leading_genes)
+
+write.csv(
+  de_ifna_mast_no_module,
+  file.path(out_dir, "ROSMAP_LE35_user_code_MAST_no_LE35_genes.csv"),
+  row.names = FALSE
+)
+
+deg_sig <- de_ifna_mast_no_module %>%
+  filter(p_val_adj < 0.05)
+
+up_genes <- deg_sig %>%
+  filter(avg_log2FC > 0) %>%
+  pull(gene) %>%
+  unique()
+
+down_genes <- deg_sig %>%
+  filter(avg_log2FC < 0) %>%
+  pull(gene) %>%
+  unique()
+
+cat("Up genes:", length(up_genes), "\n")
+cat("Down genes:", length(down_genes), "\n")
+
+write.table(
+  data.frame(gene = up_genes),
+  file.path(out_dir, "ROSMAP_LE35_user_code_up_genes_sig_no_LE35.tsv"),
+  sep = "\t",
+  quote = FALSE,
+  row.names = FALSE
+)
+write.table(
+  data.frame(gene = down_genes),
+  file.path(out_dir, "ROSMAP_LE35_user_code_down_genes_sig_no_LE35.tsv"),
+  sep = "\t",
+  quote = FALSE,
+  row.names = FALSE
+)
+
+up_entrez <- bitr(
+  up_genes,
+  fromType = "SYMBOL",
+  toType = "ENTREZID",
+  OrgDb = org.Hs.eg.db
+)
+
+down_entrez <- bitr(
+  down_genes,
+  fromType = "SYMBOL",
+  toType = "ENTREZID",
+  OrgDb = org.Hs.eg.db
+)
+
+write.csv(up_entrez, file.path(out_dir, "ROSMAP_LE35_user_code_up_entrez.csv"), row.names = FALSE)
+write.csv(down_entrez, file.path(out_dir, "ROSMAP_LE35_user_code_down_entrez.csv"), row.names = FALSE)
+
+ego_up_bp <- enrichGO(
+  gene = unique(up_entrez$ENTREZID),
+  OrgDb = org.Hs.eg.db,
+  keyType = "ENTREZID",
+  ont = "BP",
+  pAdjustMethod = "BH",
+  pvalueCutoff = 1,
+  qvalueCutoff = 1,
+  readable = TRUE
+)
+
+ego_down_bp <- enrichGO(
+  gene = unique(down_entrez$ENTREZID),
+  OrgDb = org.Hs.eg.db,
+  keyType = "ENTREZID",
+  ont = "BP",
+  pAdjustMethod = "BH",
+  pvalueCutoff = 0.1,
+  qvalueCutoff = 0.2,
+  readable = TRUE
+)
+
+ego_up_df <- as.data.frame(ego_up_bp)
+ego_down_df <- as.data.frame(ego_down_bp)
+
+write.csv(ego_up_df, file.path(out_dir, "ROSMAP_LE35_user_code_up_GOBP.csv"), row.names = FALSE)
+write.csv(ego_down_df, file.path(out_dir, "ROSMAP_LE35_user_code_down_GOBP.csv"), row.names = FALSE)
+saveRDS(ego_up_bp, file.path(out_dir, "ROSMAP_LE35_user_code_up_GOBP.rds"))
+saveRDS(ego_down_bp, file.path(out_dir, "ROSMAP_LE35_user_code_down_GOBP.rds"))
+
+vascular_ids <- c(
+  "GO:0010232", "GO:0070527", "GO:2001212", "GO:0003018",
+  "GO:0007596", "GO:0030168", "GO:0050817", "GO:0007599"
+)
+vascular_up <- ego_up_df %>% filter(ID %in% vascular_ids)
+vascular_down <- ego_down_df %>% filter(ID %in% vascular_ids)
+
+write.csv(vascular_up, file.path(out_dir, "ROSMAP_LE35_user_code_vascular_GOBP_up.csv"), row.names = FALSE)
+write.csv(vascular_down, file.path(out_dir, "ROSMAP_LE35_user_code_vascular_GOBP_down.csv"), row.names = FALSE)
+
+summary_df <- data.frame(
+  genes_used = length(genes_use),
+  missing_genes = paste(missing_genes, collapse = ", "),
+  score_col = score_col,
+  q25 = unname(q25),
+  q75 = unname(q75),
+  IFNA_low = unname(state_table["IFNA_low"]),
+  IFNA_high = unname(state_table["IFNA_high"]),
+  MAST_cells = ncol(rosmap_ifna_sub),
+  latent_vars = paste(latent_use, collapse = ", "),
+  MAST_genes = nrow(de_ifna_mast),
+  sig_no_LE35 = nrow(deg_sig),
+  up_genes = length(up_genes),
+  down_genes = length(down_genes),
+  up_GOBP_terms = nrow(ego_up_df),
+  down_GOBP_terms = nrow(ego_down_df),
+  up_GOBP_padj_lt_0.05 = sum(ego_up_df$p.adjust < 0.05, na.rm = TRUE),
+  down_GOBP_padj_lt_0.05 = sum(ego_down_df$p.adjust < 0.05, na.rm = TRUE)
+)
+write.csv(summary_df, file.path(out_dir, "ROSMAP_LE35_user_code_summary.csv"), row.names = FALSE)
+
+cat("\n===== Summary =====\n")
+print(summary_df)
+cat("\n===== vascular_gobp_up =====\n")
+print(vascular_up[, intersect(c("ID", "Description", "FoldEnrichment", "p.adjust", "Count", "GeneRatio", "pvalue", "qvalue", "geneID"), colnames(vascular_up)), drop = FALSE])
+cat("\n===== vascular_gobp_down =====\n")
+print(vascular_down[, intersect(c("ID", "Description", "FoldEnrichment", "p.adjust", "Count", "GeneRatio", "pvalue", "qvalue", "geneID"), colnames(vascular_down)), drop = FALSE])
+
+message("Done. Output directory: ", out_dir)
+
+
+library(Seurat)
+library(UCell)
+library(dplyr)
+ifna_leading_genes <- c(
+  "OAS1", "HERC6", "LPAR6", "GBP4", "C1S", "CNP","IFIT3", "PNPT1",
+  "CMTR1", "ISG15", "TMEM140", "IFI44L", "EPSTI1", "OGFR",
+  "TXNIP", "GMPR", "MX1", "PARP14", "IFITM2", "DHX58",
+  "PSMA3", "PARP9", "UBA7", "IFIH1", "PSMB9", "TDRD7",
+  "PSMB8", "PSME2", "PLSCR1", "UBE2L6", "IFI27", "EIF2AK2",
+  "TRIM14", "LGALS3BP", "IRF7"
+)
+
+genes_use <- intersect(ifna_leading_genes, rownames(ROSMAP_pericyte))
+missing_genes <- setdiff(ifna_leading_genes, rownames(ROSMAP_pericyte))
+
+cat("Genes used:", length(genes_use), "\n")
+cat("Missing genes:", paste(missing_genes, collapse = ", "), "\n")
+
+
+rosmap_pericyte <- AddModuleScore_UCell(
+  ROSMAP_pericyte,
+  features = list(IFNA_ROSMAP_LE = genes_use),
+  name = NULL
+)
+
+colnames(rosmap_pericyte@meta.data)[
+  grepl("IFNA_ROSMAP_LE", colnames(rosmap_pericyte@meta.data))
+]
+
+score_col <- "IFNA_ROSMAP_LE"
+score <- rosmap_pericyte@meta.data[[score_col]]
+
+q25 <- quantile(score, 0.25, na.rm = TRUE)
+q75 <- quantile(score, 0.75, na.rm = TRUE)
+
+rosmap_pericyte$IFNA_state <- NA
+rosmap_pericyte$IFNA_state[score <= q25] <- "IFNA_low"
+rosmap_pericyte$IFNA_state[score >= q75] <- "IFNA_high"
+
+table(rosmap_pericyte$IFNA_state, useNA = "ifany")
+
+
+rosmap_ifna_sub <- subset(
+  rosmap_pericyte,
+  subset = IFNA_state %in% c("IFNA_low", "IFNA_high")
+)
+
+rosmap_ifna_sub$IFNA_state <- factor(
+  rosmap_ifna_sub$IFNA_state,
+  levels = c("IFNA_low", "IFNA_high")
+)
+
+Idents(rosmap_ifna_sub) <- "IFNA_state"
+
+
+latent_use <- c("nFeature_RNA", "percent.mt")
+latent_use <- latent_use[latent_use %in% colnames(rosmap_ifna_sub@meta.data)]
+
+latent_use
+
+
+
+de_ifna_mast <- FindMarkers(
+  object = rosmap_ifna_sub,
+  ident.1 = "IFNA_high",
+  ident.2 = "IFNA_low",
+  test.use = "MAST",
+  assay = "RNA",
+  latent.vars = latent_use,
+  logfc.threshold = 0,
+  min.pct = 0.05
+)
+
+de_ifna_mast$gene <- rownames(de_ifna_mast)
+
+de_ifna_mast <- de_ifna_mast %>%
+  arrange(p_val_adj)
+
+head(de_ifna_mast, 20)
+
+
+
+de_ifna_mast_no_module <- de_ifna_mast %>%
+  filter(!gene %in% ifna_leading_genes)
+
+library(dplyr)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+deg_sig <- de_ifna_mast_no_module %>%
+  filter(p_val_adj < 0.05)
+
+up_genes <- deg_sig %>%
+  filter(avg_log2FC > 0) %>%
+  pull(gene) %>%
+  unique()
+
+down_genes <- deg_sig %>%
+  filter(avg_log2FC < 0) %>%
+  pull(gene) %>%
+  unique()
+
+length(up_genes)
+length(down_genes)
+up_entrez <- bitr(
+  up_genes,
+  fromType = "SYMBOL",
+  toType = "ENTREZID",
+  OrgDb = org.Hs.eg.db
+)
+
+down_entrez <- bitr(
+  down_genes,
+  fromType = "SYMBOL",
+  toType = "ENTREZID",
+  OrgDb = org.Hs.eg.db
+)
+ego_up_bp <- enrichGO(
+  gene = unique(up_entrez$ENTREZID),
+  OrgDb = org.Hs.eg.db,
+  keyType = "ENTREZID",
+  ont = "BP",
+  pAdjustMethod = "BH",
+  pvalueCutoff = 1,
+  qvalueCutoff = 1,
+  readable = TRUE
+)
+
+ego_down_bp <- enrichGO(
+  gene = unique(down_entrez$ENTREZID),
+  OrgDb = org.Hs.eg.db,
+  keyType = "ENTREZID",
+  ont = "BP",
+  pAdjustMethod = "BH",
+  pvalueCutoff = 0.1,
+  qvalueCutoff = 0.2,
+  readable = TRUE
+)
+
+background_genes <- unique(de_ifna_mast_no_module$gene)
+
+background_entrez <- bitr(
+  background_genes,
+  fromType = "SYMBOL",
+  toType = "ENTREZID",
+  OrgDb = org.Hs.eg.db
+)
+
+ego_up_bp <- enrichGO(
+  gene = unique(up_entrez$ENTREZID),
+  universe = unique(background_entrez$ENTREZID),
+  OrgDb = org.Hs.eg.db,
+  keyType = "ENTREZID",
+  ont = "BP",
+  pAdjustMethod = "BH",
+  pvalueCutoff = 1,
+  qvalueCutoff = 1,
+  readable = TRUE
+)
+
+ego_down_bp <- enrichGO(
+  gene = unique(down_entrez$ENTREZID),
+  universe = unique(background_entrez$ENTREZID),
+  OrgDb = org.Hs.eg.db,
+  keyType = "ENTREZID",
+  ont = "BP",
+  pAdjustMethod = "BH",
+  pvalueCutoff = 1,
+  qvalueCutoff = 1,
+  readable = TRUE
+)
+
+
+
+
+
+
+
+
+
+library(ggplot2)
+library(dplyr)
+library(tibble)
+
+score_col <- "IFNA_ROSMAP_LE"
+
+plot_df <- rosmap_pericyte@meta.data %>%
+  tibble::rownames_to_column("cell") %>%
+  dplyr::transmute(
+    cell,
+    IFNA_score = .data[[score_col]]
+  ) %>%
+  dplyr::filter(is.finite(IFNA_score))
+
+q25 <- as.numeric(
+  stats::quantile(plot_df$IFNA_score, 0.25, na.rm = TRUE)
+)
+
+q75 <- as.numeric(
+  stats::quantile(plot_df$IFNA_score, 0.75, na.rm = TRUE)
+)
+
+x99 <- as.numeric(
+  stats::quantile(plot_df$IFNA_score, 0.99, na.rm = TRUE)
+)
+bin_width <- x99 / 20
+
+p_ifna_distribution_clean <- ggplot(
+  plot_df,
+  aes(x = IFNA_score)
+) +
+  
+  annotate(
+    "rect",
+    xmin = 0,
+    xmax = q25,
+    ymin = -Inf,
+    ymax = Inf,
+    fill = "#4C78A8",
+    alpha = 0.05
+  ) +
+  
+  annotate(
+    "rect",
+    xmin = q25,
+    xmax = q75,
+    ymin = -Inf,
+    ymax = Inf,
+    fill = "grey70",
+    alpha = 0.025
+  ) +
+  
+  annotate(
+    "rect",
+    xmin = q75,
+    xmax = x99,
+    ymin = -Inf,
+    ymax = Inf,
+    fill = "#E45756",
+    alpha = 0.04
+  ) +
+  
+  geom_histogram(
+    aes(y = after_stat(density)),
+    binwidth = bin_width,
+    boundary = 0,
+    closed = "left",
+    fill = "grey70",
+    color = "white",
+    linewidth = 0.25
+  ) +
+  
+  geom_density(
+    color = "black",
+    linewidth = 1,
+    adjust = 1
+  ) +
+  
+  geom_vline(
+    xintercept = q25,
+    color = "#4C78A8",
+    linetype = "dashed",
+    linewidth = 0.8
+  ) +
+  
+  geom_vline(
+    xintercept = q75,
+    color = "#E45756",
+    linetype = "dashed",
+    linewidth = 0.8
+  ) +
+  
+  coord_cartesian(
+    xlim = c(0, x99),
+    clip = "on"
+  ) +
+  
+  scale_x_continuous(
+    limits = c(0, x99),
+    expand = expansion(mult = c(0, 0))
+  ) +
+  
+  scale_y_continuous(
+    expand = expansion(mult = c(0, 0.03))
+  ) +
+  
+  labs(
+    x = NULL,
+    y = NULL
+  ) +
+  
+  theme_classic(base_size = 12) +
+  
+  theme(
+    text = element_blank(),
+    axis.text = element_blank(),
+    axis.title = element_blank(),
+    axis.ticks = element_blank(),
+    
+    axis.line.x = element_line(
+      color = "black",
+      linewidth = 0.6
+    ),
+    
+    axis.line.y = element_line(
+      color = "black",
+      linewidth = 0.6
+    ),
+    
+    legend.position = "none",
+    
+    plot.margin = ggplot2::margin(
+      t = 5,
+      r = 5,
+      b = 5,
+      l = 5
+    )
+  )
+p_ifna_distribution_clean
+
+
+
+library(dplyr)
+library(ggplot2)
+library(ggrepel)
+fc_cut <- 0.25
+padj_cut <- 0.05
+
+volcano_df2 <- volcano_df %>%
+  dplyr::mutate(
+    significance = dplyr::case_when(
+      p_val_adj < padj_cut & avg_log2FC >  fc_cut ~ "Upregulated",
+      p_val_adj < padj_cut & avg_log2FC < -fc_cut ~ "Downregulated",
+      TRUE ~ "Not significant"
+    ),
+    significance = factor(
+      significance,
+      levels = c(
+        "Upregulated",
+        "Downregulated",
+        "Not significant"
+      )
+    )
+  )
+
+table(volcano_df2$significance)
+
+label_df <- dplyr::bind_rows(
+  volcano_df2 %>%
+    dplyr::filter(significance == "Upregulated") %>%
+    dplyr::arrange(p_val_adj, dplyr::desc(abs(avg_log2FC))) %>%
+    dplyr::slice_head(n = 6),
+  
+  volcano_df2 %>%
+    dplyr::filter(significance == "Downregulated") %>%
+    dplyr::arrange(p_val_adj, dplyr::desc(abs(avg_log2FC))) %>%
+    dplyr::slice_head(n = 4)
+)
+scale_color_manual(
+  values = c(
+    "Upregulated" = "#E45756",
+    "Downregulated" = "#4C78A8",
+    "Not significant" = "grey78"
+  )
+)
+
+p_volcano <- ggplot(
+  volcano_df2,
+  aes(x = avg_log2FC, y = neg_log10_padj)
+) +
+  geom_point(
+    aes(color = significance),
+    size = 1.6,
+    alpha = 0.78
+  ) +
+  geom_vline(
+    xintercept = c(-fc_cut, fc_cut),
+    linetype = "dashed",
+    linewidth = 0.5,
+    color = "grey45"
+  ) +
+  geom_hline(
+    yintercept = -log10(padj_cut),
+    linetype = "dashed",
+    linewidth = 0.5,
+    color = "grey45"
+  ) +
+  ggrepel::geom_text_repel(
+    data = label_df,
+    aes(label = gene),
+    size = 3.2,
+    box.padding = 0.35,
+    point.padding = 0.2,
+    segment.color = "grey55",
+    segment.size = 0.35,
+    min.segment.length = 0,
+    max.overlaps = Inf,
+    show.legend = FALSE
+  ) +
+  scale_color_manual(
+    values = c(
+      "Upregulated" = "#E45756",
+      "Downregulated" = "#4C78A8",
+      "Not significant" = "grey78"
+    )
+  ) +
+  coord_cartesian(xlim = c(-1.5, 4.5)) +
+  labs(
+    x = expression(log[2]~fold~change),
+    y = expression(-log[10]~adjusted~italic(P)),
+    color = NULL
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+    axis.title = element_text(face = "bold", size = 11),
+    axis.text = element_text(color = "black", size = 10),
+    axis.line = element_line(color = "black", linewidth = 0.5),
+    axis.ticks = element_line(color = "black", linewidth = 0.45),
+    legend.position = "top",
+    legend.text = element_text(size = 10),
+    plot.margin = ggplot2::margin(8, 10, 8, 8)
+  )
+
+p_volcano
+
+
+
+
+
+library(dplyr)
+library(ggplot2)
+library(forcats)
+
+go_up_bar_df <- go_up_selected %>%
+  dplyr::mutate(
+    minus_log10_p = -log10(pvalue),
+    Term = forcats::fct_reorder(Term, minus_log10_p)
+  )
+
+p_go_up <- ggplot(
+  go_up_bar_df,
+  aes(x = minus_log10_p, y = Term)
+) +
+  geom_col(
+    width = 0.72,
+    fill = "#E45756",
+    color = "black",
+    linewidth = 0.45
+  ) +
+  scale_x_continuous(
+    expand = expansion(mult = c(0, 0.05))
+  ) +
+  labs(
+    x = expression(-log[10](italic(P))),
+    y = NULL
+  ) +
+  theme_classic(base_size = 11) +
+  theme(
+    axis.title.x = element_text(
+      face = "bold",
+      size = 10.5
+    ),
+    axis.text.x = element_text(
+      color = "black",
+      size = 9
+    ),
+    axis.text.y = element_text(
+      color = "black",
+      size = 9
+    ),
+    axis.line = element_line(
+      color = "black",
+      linewidth = 0.5
+    ),
+    axis.ticks = element_line(
+      color = "black",
+      linewidth = 0.45
+    ),
+    plot.margin = ggplot2::margin(
+      t = 5,
+      r = 8,
+      b = 5,
+      l = 5
+    )
+  )
+
+p_go_up
+
+go_down_bar_df <- go_down_selected %>%
+  dplyr::mutate(
+    minus_log10_p = -log10(pvalue),
+    Term = forcats::fct_reorder(Term, minus_log10_p)
+  )
+
+p_go_down <- ggplot(
+  go_down_bar_df,
+  aes(x = minus_log10_p, y = Term)
+) +
+  geom_col(
+    width = 0.72,
+    fill = "#4C78A8",
+    color = "black",
+    linewidth = 0.45
+  ) +
+  scale_x_continuous(
+    expand = expansion(mult = c(0, 0.05))
+  ) +
+  labs(
+    x = expression(-log[10](italic(P))),
+    y = NULL
+  ) +
+  theme_classic(base_size = 11) +
+  theme(
+    axis.title.x = element_text(
+      face = "bold",
+      size = 10.5
+    ),
+    axis.text.x = element_text(
+      color = "black",
+      size = 9
+    ),
+    axis.text.y = element_text(
+      color = "black",
+      size = 9
+    ),
+    axis.line = element_line(
+      color = "black",
+      linewidth = 0.5
+    ),
+    axis.ticks = element_line(
+      color = "black",
+      linewidth = 0.45
+    ),
+    plot.margin = ggplot2::margin(
+      t = 5,
+      r = 8,
+      b = 5,
+      l = 5
+    )
+  )
+
+p_go_down
+
+library(dplyr)
+library(ggplot2)
+cor_df <- rosmap_pericyte@meta.data %>%
+  dplyr::transmute(
+    IFNA35_score = IFNA_ROSMAP_LE,
+    Hallmark_IFNA_score = Hallmark_IFNA
+  ) %>%
+  dplyr::filter(
+    is.finite(IFNA35_score),
+    is.finite(Hallmark_IFNA_score)
+  )
+
+cor_test <- stats::cor.test(
+  cor_df$IFNA35_score,
+  cor_df$Hallmark_IFNA_score,
+  method = "spearman",
+  exact = FALSE
+)
+
+rho_value <- unname(cor_test$estimate)
+p_value <- cor_test$p.value
+
+p_label <- if (p_value < 2.2e-16) {
+  "P < 2.2 × 10^-16"
+} else if (p_value < 0.001) {
+  paste0("P = ", format(p_value, scientific = TRUE, digits = 2))
+} else {
+  paste0("P = ", signif(p_value, 3))
+}
+
+cor_label <- paste0(
+  "Spearman \u03c1 = ", sprintf("%.2f", rho_value),
+  "\n",
+  p_label
+)
+
+p_score_cor <- ggplot(
+  cor_df,
+  aes(
+    x = IFNA35_score,
+    y = Hallmark_IFNA_score
+  )
+) +
+  geom_point(
+    size = 1,
+    alpha = 0.30,
+    color = "grey35"
+  ) +
+  geom_smooth(
+    method = "lm",
+    formula = y ~ x,
+    se = TRUE,
+    linewidth = 0.9,
+    color = "black",
+    fill = "grey75",
+    alpha = 0.20
+  ) +
+  annotate(
+    "text",
+    x = -Inf,
+    y = Inf,
+    label = cor_label,
+    hjust = -0.05,
+    vjust = 1.2,
+    size = 4
+  ) +
+  labs(
+    x = "35-gene IFNA signature score",
+    y = "Hallmark IFN-\u03b1 response score"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+    axis.title = element_text(
+      face = "bold",
+      size = 11
+    ),
+    axis.text = element_text(
+      color = "black",
+      size = 10
+    ),
+    axis.line = element_line(
+      color = "black",
+      linewidth = 0.55
+    ),
+    axis.ticks = element_line(
+      color = "black",
+      linewidth = 0.45
+    ),
+    plot.margin = ggplot2::margin(
+      t = 8,
+      r = 10,
+      b = 8,
+      l = 8
+    )
+  )
+
+p_score_cor
+
+
+
+
+
+
+
+library(Seurat)
+library(UCell)
+library(dplyr)
+library(tibble)
+library(ggplot2)
+
+DefaultAssay(saarland_pericyte) <- "RNA"
+
+ifna_leading_genes <- c(
+  "OAS1", "HERC6", "LPAR6", "GBP4", "C1S", "CNP", "IFIT3", "PNPT1",
+  "CMTR1", "ISG15", "TMEM140", "IFI44L", "EPSTI1", "OGFR",
+  "TXNIP", "GMPR", "MX1", "PARP14", "IFITM2", "DHX58",
+  "PSMA3", "PARP9", "UBA7", "IFIH1", "PSMB9", "TDRD7",
+  "PSMB8", "PSME2", "PLSCR1", "UBE2L6", "IFI27", "EIF2AK2",
+  "TRIM14", "LGALS3BP", "IRF7"
+)
+
+saarland_genes_use <- intersect(
+  ifna_leading_genes,
+  rownames(saarland_pericyte)
+)
+
+saarland_missing_genes <- setdiff(
+  ifna_leading_genes,
+  rownames(saarland_pericyte)
+)
+
+cat("Genes used:", length(saarland_genes_use), "\n")
+cat("Missing genes:", paste(saarland_missing_genes, collapse = ", "), "\n")
+saarland_pericyte <- AddModuleScore_UCell(
+  saarland_pericyte,
+  features = list(IFNA_ROSMAP_LE = saarland_genes_use),
+  name = NULL
+)
+
+grep(
+  "IFNA_ROSMAP_LE",
+  colnames(saarland_pericyte@meta.data),
+  value = TRUE
+)
+
+score_col <- "IFNA_ROSMAP_LE"
+summary(saarland_pericyte@meta.data[[score_col]])
+
+
+saarland_ifna_gene_detection <- tibble(
+  gene = ifna_leading_genes,
+  detected = gene %in% rownames(saarland_pericyte)
+)
+
+
+saarland_ifna_leading_genes <- c(
+  "IFI27", "PARP12", "IFI35", "B2M", "TXNIP", "IL7",
+  "NCOA7", "MX1", "LAP3", "CD74", "PARP9", "PARP14",
+  "NUB1", "IFI44L", "IFI44", "IFIT3", "CD47", "IFIH1",
+  "TAP1", "BST2", "CSF1", "TENT5A", "PLSCR1", "EPSTI1",
+  "PSMA3", "CNP", "SAMD9"
+)
+
+length(saarland_ifna_leading_genes)
+saarland_le_genes_use <- intersect(
+  saarland_ifna_leading_genes,
+  rownames(saarland_pericyte)
+)
+
+saarland_le_missing <- setdiff(
+  saarland_ifna_leading_genes,
+  rownames(saarland_pericyte)
+)
+
+cat("Saarland leading-edge genes used:",
+    length(saarland_le_genes_use), "\n")
+
+cat("Missing genes:",
+    paste(saarland_le_missing, collapse = ", "), "\n")
+
+
+saarland_pericyte <- AddModuleScore_UCell(
+  saarland_pericyte,
+  features = list(
+    IFNA_SAARLAND_LE = saarland_le_genes_use
+  ),
+  name = NULL
+)
+
+grep(
+  "IFNA",
+  colnames(saarland_pericyte@meta.data),
+  value = TRUE
+)
+
+
+cor_test_all <- cor.test(
+  saarland_pericyte$IFNA_ROSMAP_LE,
+  saarland_pericyte$IFNA_SAARLAND_LE,
+  method = "spearman",
+  exact = FALSE
+)
+
+cor_test_all
+
+
+##########检查重复基因######
+overlap_genes <- intersect(
+  ifna_leading_genes,
+  saarland_ifna_leading_genes
+)
+
+rosmap_only_genes <- setdiff(
+  ifna_leading_genes,
+  saarland_ifna_leading_genes
+)
+
+saarland_only_genes <- setdiff(
+  saarland_ifna_leading_genes,
+  ifna_leading_genes
+)
+
+cat("Overlap:", length(overlap_genes), "\n")
+cat("ROSMAP-only:", length(rosmap_only_genes), "\n")
+cat("Saarland-only:", length(saarland_only_genes), "\n")
+
+overlap_genes
+
+rosmap_only_use <- intersect(
+  rosmap_only_genes,
+  rownames(saarland_pericyte)
+)
+
+saarland_only_use <- intersect(
+  saarland_only_genes,
+  rownames(saarland_pericyte)
+)
+
+length(rosmap_only_use)
+length(saarland_only_use)
+saarland_pericyte <- AddModuleScore_UCell(
+  saarland_pericyte,
+  features = list(
+    ROSMAP_IFNA_NONOVERLAP = rosmap_only_use,
+    SAARLAND_IFNA_NONOVERLAP = saarland_only_use
+  ),
+  name = NULL
+)
+
+grep(
+  "NONOVERLAP",
+  colnames(saarland_pericyte@meta.data),
+  value = TRUE
+)
+
+cor_test_nonoverlap <- cor.test(
+  saarland_pericyte$ROSMAP_IFNA_NONOVERLAP,
+  saarland_pericyte$SAARLAND_IFNA_NONOVERLAP,
+  method = "spearman",
+  exact = FALSE
+)
+
+cor_test_nonoverlap
+
+
+
+
+score_col <- "IFNA_ROSMAP_LE"
+score <- saarland_pericyte@meta.data[[score_col]]
+q25 <- quantile(score, 0.25, na.rm = TRUE)
+q75 <- quantile(score, 0.75, na.rm = TRUE)
+cat("Saarland q25 =", q25, "\n")
+cat("Saarland q75 =", q75, "\n")
+
+saarland_pericyte$IFNA_state <- NA_character_
+saarland_pericyte$IFNA_state[
+  score <= q25
+] <- "IFNA_low"
+saarland_pericyte$IFNA_state[
+  score >= q75
+] <- "IFNA_high"
+table(
+  saarland_pericyte$IFNA_state,
+  useNA = "ifany"
+)
+
+
+saarland_ifna_sub <- subset(
+  saarland_pericyte,
+  subset = IFNA_state %in% c(
+    "IFNA_low",
+    "IFNA_high"
+  )
+)
+saarland_ifna_sub$IFNA_state <- factor(
+  saarland_ifna_sub$IFNA_state,
+  levels = c(
+    "IFNA_low",
+    "IFNA_high"
+  )
+)
+Idents(saarland_ifna_sub) <- "IFNA_state"
+table(saarland_ifna_sub$IFNA_state)
+
+latent_use <- c(
+  "nFeature_RNA",
+  "percent.mt"
+)
+latent_use <- latent_use[
+  latent_use %in%
+    colnames(saarland_ifna_sub@meta.data)
+]
+latent_use
+
+
+de_saarland_ifna_mast <- FindMarkers(
+  object = saarland_ifna_sub,
+  ident.1 = "IFNA_high",
+  ident.2 = "IFNA_low",
+  test.use = "MAST",
+  assay = "RNA",
+  latent.vars = latent_use,
+  logfc.threshold = 0,
+  min.pct = 0.05
+)
+de_saarland_ifna_mast$gene <- rownames(
+  de_saarland_ifna_mast
+)
+de_saarland_ifna_mast <- de_saarland_ifna_mast %>%
+  arrange(p_val_adj)
+head(de_saarland_ifna_mast, 30)
+
+de_saarland_no_module <- de_saarland_ifna_mast %>%
+  filter(
+    !gene %in% ifna_leading_genes
+  )
+
+saarland_deg_sig <- de_saarland_no_module %>%
+  filter(p_val_adj < 0.05)
+
+saarland_up_genes <- saarland_deg_sig %>%
+  filter(avg_log2FC > 0) %>%
+  pull(gene) %>%
+  unique()
+
+saarland_down_genes <- saarland_deg_sig %>%
+  filter(avg_log2FC < 0) %>%
+  pull(gene) %>%
+  unique()
+
+length(saarland_up_genes)
+length(saarland_down_genes)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
